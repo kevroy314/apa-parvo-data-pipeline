@@ -14,6 +14,15 @@ $RECYCLE.BIN/
 *.msm
 *.msp
 
+# Log Files, Input Files, Database Files and HTML Files
+*.txt
+*.htm
+*.html
+*.json
+*.log
+data
+data_parvo_filter
+
 # Windows shortcuts
 *.lnk
 
