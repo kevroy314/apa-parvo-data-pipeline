@@ -8,21 +8,22 @@ import traceback
 import _strptime
 from datetime import datetime, timedelta
 from threading import Thread, Event
+import operator
 
 import numpy as np
 import pandas as pd
 from lxml import html
 from pandas import DataFrame
-from tinydb import *
+from tinydb import *  # This should probably be transitioned to sqlite3 at some point
 
 os.remove('db.json')
 
 db = TinyDB('db.json')
 
 settings = {
-            'directory': 'C:\\Users\\Kevin\\PycharmProjects\\ParvoCrawler\\data',
-            'input_filename': 'C:\\Users\\Kevin\\PycharmProjects\\ParvoCrawler\\parvo.txt',
-            'concurrency': 20,
+            'directory': 'data',
+            'input_filename': 'parvo.txt',
+            'concurrency': None,  # This script often runs faster w/o concurrency due the database and proc requirements
             'log_level': 'DEBUG'
            }
 ###########################
@@ -66,7 +67,7 @@ pd.set_option('expand_frame_repr', False)
 a_num_regex = re.compile('A\d\d\d\d\d\d\d\d')
 
 
-def get_array_from_table(table, remove_empties=True):
+def get_array_from_table(table, remove_empties=False):
     frame = []
     rows = table.cssselect("tr")
     for row in rows:
@@ -78,7 +79,77 @@ def get_array_from_table(table, remove_empties=True):
     return frame
 
 
+def validate_shape(table, expected_size):
+    if expected_size is None:
+        return True
+    if np.array(table).shape != expected_size:
+        logging.debug('Table has unexpected shape (expected {0}).'.format(expected_size))
+        logging.debug('\n'+str(DataFrame(table)))
+        return False
+    return True
+
+
+# noinspection PyBroadException
+def parse_element(data, specification, debug_label=''):
+    # Validate input specification shape
+    if (not isinstance(specification, type([]))) or len(specification) != 4:
+        logging.debug('Error in {1}. Parse specification {0} is either of incorrect type (expected []) '
+                      'or length (expected 4). Returning empty string pair.'.format(specification, debug_label))
+        return {'': ''}
+    # Extract specification parts
+    label = specification[0]
+    location = specification[1]
+    regex = specification[2]
+    postprocess = specification[3]
+    # Validate label
+    if not isinstance(label, type('')):
+        logging.debug('Error in {1}. The provided label for specification {0} is not a valid string. '
+                      'Returning empty string pair.'.format(specification, debug_label))
+        return {'': ''}
+    label = label.strip()
+    # Validate regex and compile if necessary
+    if isinstance(regex, type('')):
+        try:
+            regex = re.compile(regex)
+        except:
+            logging.debug('Error in {1}. The provided regular expression for specification {0} is not valid. '
+                          'Returning labelled empty string.'.format(specification, debug_label))
+            return {label: ''}
+    # Locate the data
+    try:
+        result = reduce(operator.getitem, location, data)
+    except IndexError:
+        logging.debug('Error in {1}. The provided location does not exist for {0}. '
+                      'Returning empty string.'.format(specification, debug_label))
+        return {label: ''}
+    except:
+        logging.debug('Error in {1}. There was an unknown problem during location grabbing for {0}. '
+                      'Returning labelled empty string.'.format(specification, debug_label))
+        return {label: ''}
+    # Match the regex and strip final string result
+    try:
+        regex_match = regex.search(result)
+    except:
+        logging.debug('Error in {1}. There was a problem matching regex for {0}. '
+                      'Returning labelled empty string.'.format(specification, debug_label))
+        return {label: ''}
+    if regex_match is None:
+        logging.debug('Error in {1}. No match found for {0} (string=\'{2}\'). '
+                      'Returning labelled empty string.'.format(specification, debug_label, result))
+        return {label: ''}
+    result = regex_match.group(0).strip()
+    # Postprocess the string
+    try:
+        result = postprocess(result)
+    except:
+        logging.debug('Error in {1}. There was a problem post-processing for specification {0}. '
+                      'Returning raw regex match (string=\'{2}\').'.format(specification, debug_label, result))
+    # Strip and return
+    return {label: result}
+
+
 def process_anum(a_number):
+    global db
     file_path = os.path.join(settings['directory'], 'A' + a_number + '.htm')
     if not os.path.exists(file_path):
         return
@@ -86,72 +157,46 @@ def process_anum(a_number):
         result = file_ptr.read()
     tree = html.fromstring(result)
     tables = tree.findall('.//table')
-    # Table 1
-    frame = get_array_from_table(tables[1])
-    # Validate Shape
-    if np.array(frame).shape != (2, 1):
-        logging.debug('\n'+str(DataFrame(frame)))
+    frames = [get_array_from_table(table) for table in tables]
+    # Validate Shapes
+    expected_shapes = {None, (2L,), (4L, 3L)}
+    for frame, shape in zip(frames, expected_shapes):
+        validate_shape(frame, shape)
+    parser_table = [  # key, frame_loc, regex
+                        # Table 1
+                        ['anum', [1, 0, 0], "(?!:\s*)[Aa]\d{8}", lambda x: x],
+                        ['print_date', [1, 1, 0], "(?!:\s*)\d.*M", lambda x: datetime.strptime(x, '%m/%d/%Y %I:%M%p')],
+                        # Table 2
+                        ['confirmation_anum', [2, 0, 0], "(?!:\s*)[Aa]\d{8}", lambda x: x],
+                        ['alt_id', [2, 1, 0], ".*", lambda x: x],
+                        ['gender', [2, 2, 1], "([Mm]ale)|([Ff]emale)|([Uu]nknown)", lambda x: x.lower()],
+                        ['age_range', [2, 3, 1], ".*", lambda x: x.replace('no longer in use', '').strip()],
+                        ['name', [2, 0, 1], ".*", lambda x: x.strip()],
+                        ['declawed', [2, 2, 2], "(?=Declawed:).*", lambda x: x.split(':')[1].strip()],
+                        ['bite_history', [2, 3, 2], "(?=Bitten:).*", lambda x: x.split(':')[1].strip()],
+                        ['physical_attributes', [2, 0, 2], ".*", lambda x: [y.strip() for y in x.split(',')]],
+                        ['species', [2, 1, 1], "([Dd]og)|([Cc]at)|([Uu]nknown)", lambda x: x.lower()],
+                        ['age', [2, 1, 2], "^.*(?=\s+\,\s+)", lambda x: x],
+                        ['dob', [2, 1, 2], "\d+\/\d+\/\d+", lambda x: datetime.strptime(x, '%m/%d/%Y')],
+                        ['spay_neuter', [2, 1, 2], "(?=Spayed/Neutered:).*", lambda x: x.split(':')[1].strip()],
+
+                        # TODO: Continue table parsing... at least get the other important tables.
+                   ]
+
     # Parse Elements
-    a = frame[0][0].split(':')[1].strip()
-    d = ':'.join(frame[1][0].split(':')[1:]).strip()
-    # Validate Elements
-    if a_num_regex.search(a) is None:
-        logging.debug(a)
-    try:
-        print_date = datetime.strptime(d, '%m/%d/%Y %I:%M%p')
-    except ValueError:
-        print_date = None
-        logging.debug(d)
-    # Table 2
-    frame = get_array_from_table(tables[2], remove_empties=False)
-    # Validate Shape
-    if np.array(frame).shape != (4L, 3L):
-        logging.debug('\n' + str(DataFrame(frame)))
-    # Parse Elements
-    # noinspection PyBroadException
-    a2 = frame[0][0].strip()
-    a3 = frame[1][0].strip()
-    gender = frame[2][1].strip()
-    age_range = frame[3][1].strip()
-    name = frame[0][1].strip()
-    declawed = frame[2][2].strip().replace('Declawed:', '').strip()
-    bite_history = frame[3][2].strip().replace('Bitten:', '').strip()
-    physical_attributes = [att.strip() for att in frame[0][2].strip().split(',')]
-    species = frame[1][1].strip()
-    ads = [att.strip() for att in frame[1][2].strip().split(',')]
-    if 'dob' not in frame[1][2].strip().lower():
-        age = 'unk'
-        dob = 'unk'
-        spay_neuter = ads[0].replace('Spayed/Neutered:', '').strip()
-    else:
-        age = ads[0]
-        dob = ads[1].replace('DOB:', '').strip()
-        spay_neuter = ads[2].replace('Spayed/Neutered:', '').strip()
-    # Validate Elements
-    if a_num_regex.search(a2) is None:
-        logging.debug('Bad Table 2 ANum {0}.'.format(a2))
-    if not (gender.lower() == 'male' or gender.lower() == 'female' or gender.lower() == 'unknown'):
-        logging.debug('Bad Table 2 Gender {0}.'.format(gender))
-    if not (species.lower() == 'dog' or species.lower() == 'cat'):
-        logging.debug('Bad Table 2 species {0}.'.format(species))
-    try:
-        if dob is not 'unk':
-            dob = datetime.strptime(dob, '%m/%d/%Y')
-    except ValueError:
-        logging.debug('Bad DOB {0}.'.format(dob))
-    if not (spay_neuter.lower() == 'yes' or spay_neuter.lower() == 'no', spay_neuter == 'unknown'):
-        logging.debug('Bad Spay/Neuter {0}.'.format(spay_neuter))
-    # Table 3
-    # TODO: Continue table parsing... at least get the other important tables.
+    result = {}
+    for pt in parser_table:
+        test = parse_element(frames, pt, debug_label=a_number)
+        result.update(test)
+
     # Send to DB
-    if a and print_date:
+    if 'concurrency' in settings and settings['concurrency'] is not None:
         try:
-            database_queue.put({'anum': a, 'confirmation_anum': a2, 'alt_anum': a3, 'print_date': print_date,
-                                'gender': gender, 'age_range': age_range, 'name': name, 'declawed': declawed,
-                                'bite_history': bite_history, 'physical_attributes': physical_attributes, 'age': age,
-                                'dob': dob, 'spay_neuter': spay_neuter})
+            database_queue.put(result)
         except ValueError:
-            logging.debug('Could not send {0} to DB.'.format({'anum': a, 'print_date': print_date}))
+            logging.debug('Could not send {0} to DB.'.format(result))
+    else:
+        db.insert(result)
 
 
 def process_next_anum():
@@ -198,7 +243,7 @@ start_time = time.time()
 
 logging.info('Initializing...')
 
-if 'concurrency' in settings:
+if 'concurrency' in settings and settings['concurrency'] is not None:
     logging.info('Setting up concurrency with {0} thread(s).'.format(settings['concurrency']))
     database_writer_stop_signal = Event()
     database_queue = Queue.Queue()
@@ -234,7 +279,7 @@ else:
     # Parse all anums sequentially
     for idx, anum in enumerate(a_nums):
         if idx % 100 == 0:
-            logging.info("{0}/{1}".format(idx, len(a_nums)))
+            logging.info("{0}/{1}".format(len(a_nums)-idx, len(a_nums)))
         process_anum(anum)
 
 num_files = sum(os.path.isfile(os.path.join(settings['directory'], f)) for f in os.listdir(settings['directory']))
